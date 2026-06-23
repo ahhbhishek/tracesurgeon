@@ -13,11 +13,28 @@ error.
 | Phase | Feature | State |
 |-------|---------|-------|
 | 1 | Trace capture (LangGraph callback hook) | ✅ |
-| 2 | DAG builder (call-tree + data-flow views) | ✅ |
+| 2 | DAG builder (call-tree + timestamp data-flow) | ✅ |
 | 3 | Blame scorer (anti-blame-hoarding) | ✅ |
+| — | Hardening: real names, loops, dual-layer merge, public API | ✅ |
+| — | Validated on real `create_react_agent` graph | ✅ |
 | 4 | CLI + UI | planned |
 | 5 | Semantic Edge Inferrer | planned |
 | 6 | Counterfactual verification | planned |
+
+Validated topologies: linear, branching/multi-tool, cyclic ReAct loops, and a
+production-style `create_react_agent` graph (multi-turn, parallel tool calls,
+real `ToolNode` + message state). In every case blame lands on the upstream
+origin, not the downstream symptom.
+
+## One-liner usage
+
+```python
+from tracesurgeon import instrument, diagnose
+
+inst = instrument()
+agent.invoke(inputs, config=inst.config)   # your real LangGraph agent
+diagnose(inst.path).print()                # root-cause report
+```
 
 ## How it works
 
