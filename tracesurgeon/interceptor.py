@@ -53,7 +53,7 @@ class TraceInterceptor(BaseCallbackHandler):
     ):
         step_id = str(uuid.uuid4())[:8]
         parent_step_id = self._resolve_parent(parent_run_id)
-        node_name = self._extract_name(serialized, tags)
+        node_name = self._extract_name(serialized, tags, metadata)
 
         self._active[str(run_id)] = {
             "step_id": step_id,
@@ -285,7 +285,15 @@ class TraceInterceptor(BaseCallbackHandler):
             return None
         return self._active.get(str(parent_run_id), {}).get("step_id")
 
-    def _extract_name(self, serialized: dict | None, tags: list[str] | None) -> str:
+    def _extract_name(
+        self,
+        serialized: dict | None,
+        tags: list[str] | None,
+        metadata: dict | None = None,
+    ) -> str:
+        # LangGraph stamps the real node name here — by far the most useful label
+        if metadata and metadata.get("langgraph_node"):
+            return metadata["langgraph_node"]
         serialized = serialized or {}
         if serialized.get("name"):
             return serialized["name"]

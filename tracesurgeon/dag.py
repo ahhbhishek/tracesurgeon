@@ -1,26 +1,37 @@
 """
-DAG Builder — Phase 2.
+DAG Builder — Phase 2 (hardened).
 
-TWO graph views are built from the same trace:
+LangGraph emits TWO event layers per run:
+  - an outer task layer with generic names (graph:step:N) where TOOLS attach
+  - an inner node layer with the REAL names (plan, search, analyze) but flat
 
-  build_dag()            -> CALL TREE   (who-called-whom; great for display)
-  build_dataflow_dag()   -> DATA FLOW   (whose-output-fed-whose-input; for blame)
+To get one clean graph we:
+  1. prefer the real-named nodes as the pipeline (fall back to graph:step:N for
+     old traces that predate node-name capture)
+  2. reconstruct data flow from TIMESTAMPS, not LangGraph's parent links:
+     a tool that ran inside a node's [start, end] window belongs to that node.
 
-The call tree is what LangGraph hands us natively: step1/step2/step3 are all
-siblings under the root graph node. That's useless for blame because the tool's
-output can't "flow" to a sibling. The data-flow DAG fixes this by:
-  - chaining the pipeline steps in execution order (step1 -> step2 -> step3)
-  - pointing nested tool/llm calls INTO their step (tool -> step1)
-  - dropping the root aggregate node (it just accumulates everything)
-
-Result for a linear agent:  tool -> step1 -> step2 -> step3
-Now ancestors(step3) = {tool, step1, step2} and blame can flow back to the tool.
+Result (linear agent):  search_tool ─► search ─► fetch ─► analyze ─► report
+                          fetch_tool ─►        ┘
+Now blame can flow back from the symptom to the tool that introduced the error.
 """
 
 import json
+import re
 from pathlib import Path
 
 import networkx as nx
+
+
+# names that are LangGraph plumbing, never real user nodes
+_WRAPPER_RE = re.compile(
+    r"^(unknown_node|LangGraph|RunnableSequence|__start__|__end__|_write|ChannelWrite.*)$"
+)
+_GENERIC_RE = re.compile(r"^graph:step:\d+$")
+
+
+def _is_nested(name: str) -> bool:
+    return name.startswith("tool:") or name.startswith("llm:")
 
 
 # ------------------------------------------------------------------ #
@@ -28,66 +39,61 @@ import networkx as nx
 # ------------------------------------------------------------------ #
 
 def _parse_steps(trace_path: str) -> dict[str, dict]:
-    """Merge start/end events per step_id into one record each."""
+    """Merge start/end events per step_id into one record (with start & end ts)."""
     path = Path(trace_path)
     if not path.exists():
         raise FileNotFoundError(f"Trace not found: {trace_path}")
 
     steps: dict[str, dict] = {}
-
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            event = json.loads(line)
-            sid = event["step_id"]
-
+            e = json.loads(line)
+            sid = e["step_id"]
             if sid not in steps:
                 steps[sid] = {
                     "step_id": sid,
-                    "parent_step_id": event.get("parent_step_id"),
-                    "node_name": event["node_name"],
-                    "inputs": None,
-                    "outputs": None,
-                    "duration_ms": None,
-                    "success": True,
-                    "error": None,
-                    "start_ts": None,
+                    "parent_step_id": e.get("parent_step_id"),
+                    "node_name": e["node_name"],
+                    "inputs": None, "outputs": None,
+                    "duration_ms": None, "success": True, "error": None,
+                    "start_ts": None, "end_ts": None,
                 }
-
-            etype = event["event_type"]
+            etype = e["event_type"]
             if etype.endswith("_start"):
-                # keep the earliest start timestamp for ordering siblings
                 if steps[sid]["start_ts"] is None:
-                    steps[sid]["start_ts"] = event.get("timestamp")
-                if event.get("inputs") is not None:
-                    steps[sid]["inputs"] = event["inputs"]
-            if etype.endswith("_end") and event.get("outputs") is not None:
-                steps[sid]["outputs"] = event["outputs"]
-            if event.get("duration_ms") is not None:
-                steps[sid]["duration_ms"] = event["duration_ms"]
+                    steps[sid]["start_ts"] = e.get("timestamp")
+                if e.get("inputs") is not None:
+                    steps[sid]["inputs"] = e["inputs"]
+            if etype.endswith("_end"):
+                steps[sid]["end_ts"] = e.get("timestamp")
+                if e.get("outputs") is not None:
+                    steps[sid]["outputs"] = e["outputs"]
+            if e.get("duration_ms") is not None:
+                steps[sid]["duration_ms"] = e["duration_ms"]
             if etype == "error":
                 steps[sid]["success"] = False
-                steps[sid]["error"] = event.get("error")
-
+                steps[sid]["error"] = e.get("error")
+                steps[sid]["end_ts"] = e.get("timestamp")
     return steps
 
 
 # ------------------------------------------------------------------ #
-#  Call tree (for display)                                             #
+#  Call tree (raw, for debugging only)                                #
 # ------------------------------------------------------------------ #
 
 def build_dag(trace_path: str) -> nx.DiGraph:
-    """Call tree: parent_step_id -> step_id edges. Good for printing."""
+    """Raw call tree from parent_step_id links. Kept for low-level inspection."""
     steps = _parse_steps(trace_path)
     dag = nx.DiGraph()
-    for sid, attrs in steps.items():
-        dag.add_node(sid, **attrs)
-    for sid, attrs in steps.items():
-        parent = attrs.get("parent_step_id")
-        if parent and parent in steps:
-            dag.add_edge(parent, sid)
+    for sid, a in steps.items():
+        dag.add_node(sid, **a)
+    for sid, a in steps.items():
+        p = a.get("parent_step_id")
+        if p and p in steps:
+            dag.add_edge(p, sid)
     return dag
 
 
@@ -95,46 +101,149 @@ def build_dag(trace_path: str) -> nx.DiGraph:
 #  Data-flow graph (for blame)                                        #
 # ------------------------------------------------------------------ #
 
+def _pick_host(tool: dict, pipeline: list[dict]) -> dict | None:
+    """Find the pipeline node whose time window contains this tool's start."""
+    ts = tool.get("start_ts")
+    if not pipeline:
+        return None
+    if ts is None:
+        return pipeline[0]
+    # nodes whose [start, end] window contains the tool's start
+    contained = [
+        p for p in pipeline
+        if (p.get("start_ts") or "") <= ts and (p.get("end_ts") or "~") >= ts
+    ]
+    pool = contained or [p for p in pipeline if (p.get("start_ts") or "") <= ts]
+    if not pool:
+        return pipeline[0]
+    return max(pool, key=lambda p: p.get("start_ts") or "")
+
+
+def _merge_dual_layer(pipeline: list[dict]) -> list[dict]:
+    """
+    LangGraph emits an outer-task and an inner-node event for the SAME logical
+    step (both real-named after metadata capture). They overlap in time and share
+    a name. Collapse each such pair into one node so the pipeline reads cleanly.
+    Genuine repeated nodes in a loop are separated by other nodes, so they never
+    merge.
+    """
+    pipeline = sorted(pipeline, key=lambda a: a.get("start_ts") or "")
+    merged: list[dict] = []
+    for n in pipeline:
+        prev = merged[-1] if merged else None
+        overlaps = (
+            prev is not None
+            and prev["node_name"] == n["node_name"]
+            and (n.get("start_ts") or "") <= (prev.get("end_ts") or "~")
+        )
+        if overlaps:
+            prev["end_ts"] = max(prev.get("end_ts") or "", n.get("end_ts") or "")
+            if prev.get("outputs") is None:
+                prev["outputs"] = n.get("outputs")
+            if not n.get("success", True):
+                prev["success"] = False
+                prev["error"] = prev.get("error") or n.get("error")
+            # keep the larger measured duration
+            pd, nd = prev.get("duration_ms"), n.get("duration_ms")
+            prev["duration_ms"] = max([x for x in (pd, nd) if x is not None], default=None)
+        else:
+            merged.append(dict(n))
+    return merged
+
+
 def build_dataflow_dag(trace_path: str) -> nx.DiGraph:
-    """
-    Build a data-flow DAG where edges follow how data actually moves.
-    See module docstring for the transformation rules.
-    """
+    """Build the timestamp-reconstructed data-flow DAG used for blame analysis."""
     steps = _parse_steps(trace_path)
 
-    # root aggregate node(s): no parent
-    root_ids = {sid for sid, a in steps.items() if not a.get("parent_step_id")}
+    nested = [a for a in steps.values() if _is_nested(a["node_name"])]
+
+    # prefer real-named nodes; fall back to graph:step:N for legacy traces
+    real = [
+        a for a in steps.values()
+        if not _is_nested(a["node_name"])
+        and not _WRAPPER_RE.match(a["node_name"])
+        and not _GENERIC_RE.match(a["node_name"])
+    ]
+    if real:
+        pipeline = real
+    else:
+        pipeline = [
+            a for a in steps.values()
+            if not _is_nested(a["node_name"]) and _GENERIC_RE.match(a["node_name"])
+        ]
+
+    pipeline = _merge_dual_layer(pipeline)
+    pipeline.sort(key=lambda a: a.get("start_ts") or "")
 
     dag = nx.DiGraph()
-    for sid, attrs in steps.items():
-        if sid in root_ids:
-            continue  # drop the aggregate root from the data-flow view
-        dag.add_node(sid, **attrs)
+    for a in pipeline + nested:
+        dag.add_node(a["step_id"], **a)
 
-    # pipeline nodes = direct children of a root, ordered by start time
-    pipeline = sorted(
-        [a for sid, a in steps.items() if a.get("parent_step_id") in root_ids],
-        key=lambda a: a.get("start_ts") or "",
-    )
-    # chain them sequentially: step1 -> step2 -> step3
+    # sequential edges between pipeline steps
     for prev, nxt in zip(pipeline, pipeline[1:]):
         dag.add_edge(prev["step_id"], nxt["step_id"], edge_type="sequential")
 
-    # nested nodes (tool/llm under a step) feed INTO their step
-    for sid, a in steps.items():
-        parent = a.get("parent_step_id")
-        if parent and parent not in root_ids and parent in dag:
-            dag.add_edge(sid, parent, edge_type="nested")
+    # attach each tool/llm to its host node by time window
+    for t in nested:
+        host = _pick_host(t, pipeline)
+        if host and host["step_id"] != t["step_id"]:
+            dag.add_edge(t["step_id"], host["step_id"], edge_type="nested")
 
     return dag
 
 
 # ------------------------------------------------------------------ #
-#  Traversal helpers                                                  #
+#  Display                                                            #
 # ------------------------------------------------------------------ #
 
+def print_pipeline(flow: nx.DiGraph, highlight: list[str] | None = None) -> None:
+    """Print the data-flow pipeline top-to-bottom with tools nested under nodes."""
+    hl = set(highlight or [])
+    pipe = [n for n, d in flow.nodes(data=True) if not _is_nested(d["node_name"])]
+    pipe.sort(key=lambda n: flow.nodes[n].get("start_ts") or "")
+
+    for n in pipe:
+        d = flow.nodes[n]
+        dur = f" [{d['duration_ms']:.1f}ms]" if d.get("duration_ms") else ""
+        status = "✓" if d.get("success", True) else "✗ FAIL"
+        marker = "   ◄ ROOT CAUSE" if n in hl else ""
+        print(f"  ▼ {d['node_name']} ({n[:6]}) {status}{dur}{marker}")
+        # tools that feed this node
+        for pred in flow.predecessors(n):
+            pd = flow.nodes[pred]
+            if _is_nested(pd["node_name"]):
+                pmark = "   ◄ ROOT CAUSE" if pred in hl else ""
+                pstat = "✓" if pd.get("success", True) else "✗ FAIL"
+                print(f"      └─ {pd['node_name']} ({pred[:6]}) {pstat}{pmark}")
+
+
+def print_tree(dag: nx.DiGraph, highlight: list[str] | None = None) -> None:
+    """ASCII call-tree printer (raw build_dag graph)."""
+    hl = set(highlight or [])
+    roots = [n for n in dag.nodes if dag.in_degree(n) == 0]
+
+    def _render(node_id, prefix, is_last):
+        conn = "└── " if is_last else "├── "
+        d = dag.nodes[node_id]
+        dur = f" [{d['duration_ms']:.1f}ms]" if d.get("duration_ms") else ""
+        status = "✓" if d.get("success", True) else "✗ FAIL"
+        marker = "  ◄ ROOT CAUSE" if node_id in hl else ""
+        print(f"{prefix}{conn}{d.get('node_name', node_id)} ({node_id[:6]}) {status}{dur}{marker}")
+        kids = list(dag.successors(node_id))
+        cp = prefix + ("    " if is_last else "│   ")
+        for i, k in enumerate(kids):
+            _render(k, cp, i == len(kids) - 1)
+
+    for root in roots:
+        d = dag.nodes[root]
+        marker = "  ◄ ROOT CAUSE" if root in hl else ""
+        print(f"{d.get('node_name', root)} ({root[:6]}){marker}")
+        kids = list(dag.successors(root))
+        for i, k in enumerate(kids):
+            _render(k, "", i == len(kids) - 1)
+
+
 def find_failure_path(dag: nx.DiGraph) -> list[str]:
-    """Chain of step_ids from root to the first failed node (exceptions only)."""
     failed = [n for n, d in dag.nodes(data=True) if not d.get("success", True)]
     if not failed:
         return []
@@ -147,37 +256,10 @@ def find_failure_path(dag: nx.DiGraph) -> list[str]:
         return [failed[0]]
 
 
-def print_tree(dag: nx.DiGraph, highlight: list[str] | None = None) -> None:
-    """Print the CALL-TREE dag as an ASCII tree. Marks highlighted nodes."""
-    hl = set(highlight or [])
-    roots = [n for n in dag.nodes if dag.in_degree(n) == 0]
-
-    def _render(node_id: str, prefix: str, is_last: bool):
-        connector = "└── " if is_last else "├── "
-        data = dag.nodes[node_id]
-        name = data.get("node_name", node_id)
-        dur = f" [{data['duration_ms']:.1f}ms]" if data.get("duration_ms") else ""
-        status = "✓" if data.get("success", True) else "✗ FAIL"
-        marker = "  ◄ ROOT CAUSE" if node_id in hl else ""
-        print(f"{prefix}{connector}{name} ({node_id[:6]}) {status}{dur}{marker}")
-        kids = list(dag.successors(node_id))
-        cp = prefix + ("    " if is_last else "│   ")
-        for i, k in enumerate(kids):
-            _render(k, cp, i == len(kids) - 1)
-
-    for root in roots:
-        data = dag.nodes[root]
-        marker = "  ◄ ROOT CAUSE" if root in hl else ""
-        print(f"{data.get('node_name', root)} ({root[:6]}){marker}")
-        kids = list(dag.successors(root))
-        for i, k in enumerate(kids):
-            _render(k, "", i == len(kids) - 1)
-
-
 def summarize_dag(dag: nx.DiGraph) -> dict:
     nodes = list(dag.nodes(data=True))
     failed = [n for n, d in nodes if not d.get("success", True)]
-    tools = [n for n, d in nodes if "tool:" in d.get("node_name", "")]
+    tools = [n for n, d in nodes if _is_nested(d.get("node_name", ""))]
     durs = [d["duration_ms"] for _, d in nodes if d.get("duration_ms")]
     return {
         "total_steps": len(nodes),

@@ -11,6 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from tracesurgeon._console import enable_utf8
+enable_utf8()
+
 from tracesurgeon.dag import build_dag, build_dataflow_dag, print_tree
 from tracesurgeon.scorer import run_blame_analysis
 

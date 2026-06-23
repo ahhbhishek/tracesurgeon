@@ -19,6 +19,9 @@ from pathlib import Path
 # make sure local package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from tracesurgeon._console import enable_utf8
+enable_utf8()
+
 from typing import TypedDict, Annotated
 import operator
 

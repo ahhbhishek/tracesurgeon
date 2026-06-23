@@ -40,26 +40,24 @@ def _output_str(data: dict) -> str:
 
 
 def _has_error(data: dict) -> bool:
+    """A node 'has an error' if it threw an exception OR its output carries an error signal."""
+    if not data.get("success", True):
+        return True
     return bool(_ERROR_RE.search(_output_str(data)))
 
 
 def detect_symptom(dag: nx.DiGraph) -> str | None:
     """
-    The SYMPTOM is where the failure becomes visible.
-      - explicit exception (success=False) wins
-      - else the most DOWNSTREAM node whose output carries an error signal
-    Returns step_id or None.
+    The SYMPTOM is where the failure becomes visible = the most DOWNSTREAM node
+    that has an error (exception OR error-signal output). Walking in topological
+    order and taking the LAST hit handles exceptions and silent failures the same
+    way, and is stable for loops/branches.
     """
-    for node_id, data in dag.nodes(data=True):
-        if not data.get("success", True):
-            return node_id
-
     try:
         order = list(nx.topological_sort(dag))
     except nx.NetworkXUnfeasible:
         order = list(dag.nodes)
 
-    # walk downstream; last error node in topo order = the visible symptom
     symptom = None
     for node_id in order:
         if _has_error(dag.nodes[node_id]):
@@ -68,11 +66,18 @@ def detect_symptom(dag: nx.DiGraph) -> str | None:
 
 
 def _is_introducer(dag: nx.DiGraph, node_id: str) -> bool:
-    """True if this node has an error but no data-flow predecessor does."""
+    """
+    True if this node has an error but NONE of its upstream ancestors do.
+
+    Using the full ancestor cone (not just direct predecessors) is what makes
+    blame robust: even if the data-flow graph linearises a merge node, an error
+    that originated several hops upstream still disqualifies every downstream
+    node from being the 'introducer'. Only the true origin survives.
+    """
     if not _has_error(dag.nodes[node_id]):
         return False
-    for pred in dag.predecessors(node_id):
-        if _has_error(dag.nodes[pred]):
+    for anc in nx.ancestors(dag, node_id):
+        if _has_error(dag.nodes[anc]):
             return False
     return True
 
