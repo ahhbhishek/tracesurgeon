@@ -1,0 +1,22 @@
+# traces are generated artifacts, not source
+traces/*.jsonl
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# env
+.env
