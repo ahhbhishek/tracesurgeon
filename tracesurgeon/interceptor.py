@@ -9,18 +9,48 @@ from langchain_core.outputs import LLMResult
 from .trace import TraceEvent, TraceSession
 
 
-def _safe_serialize(obj: Any) -> Any:
-    """Convert anything to something JSON-safe."""
+# Per-field character cap for captured strings. Large enough for real LLM
+# outputs and tool results, small enough that a giant RAG document or 200KB
+# log dump doesn't bloat the trace file or slow analysis.
+_MAX_FIELD_CHARS = 8000
+_HEAD_CHARS = 5000  # keep the head (the actual content)
+_TAIL_CHARS = 2500  # AND the tail (where stack traces / final errors live)
+
+
+def _truncate(text: str) -> str:
+    """
+    Cap an over-long string while PRESERVING both ends.
+
+    A naive head-only cut would drop errors that surface at the end of a long
+    output (e.g. a traceback after pages of logs). Keeping head + tail means the
+    blame scorer still sees error signals wherever they occur.
+    """
+    if len(text) <= _MAX_FIELD_CHARS:
+        return text
+    omitted = len(text) - _HEAD_CHARS - _TAIL_CHARS
+    return (
+        text[:_HEAD_CHARS]
+        + f"\n…[TraceSurgeon: {omitted} chars omitted]…\n"
+        + text[-_TAIL_CHARS:]
+    )
+
+
+def _safe_serialize(obj: Any, _depth: int = 0) -> Any:
+    """Convert anything to something JSON-safe, with large strings truncated."""
     if obj is None:
         return None
-    if isinstance(obj, (str, int, float, bool)):
+    if isinstance(obj, str):
+        return _truncate(obj)
+    if isinstance(obj, (int, float, bool)):
         return obj
+    if _depth > 6:  # guard against pathologically deep / cyclic structures
+        return _truncate(str(obj))
     if isinstance(obj, dict):
-        return {str(k): _safe_serialize(v) for k, v in obj.items()}
+        return {str(k): _safe_serialize(v, _depth + 1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_safe_serialize(i) for i in obj]
-    # fallback: stringify
-    return str(obj)
+        return [_safe_serialize(i, _depth + 1) for i in obj]
+    # fallback: stringify (also truncated)
+    return _truncate(str(obj))
 
 
 class TraceInterceptor(BaseCallbackHandler):

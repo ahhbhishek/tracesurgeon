@@ -26,12 +26,29 @@ import networkx as nx
 
 # error signals. \b word boundaries stop "invalid" matching "invalid_tool_calls".
 _ERROR_PATTERNS = [
-    r"\berror\b", r"\bexception\b", r"\bfailed\b", r"\btraceback\b",
-    r"\binvalid\b", r"\bmalformed\b", r"\bcould not\b", r"\bunable to\b",
-    r"\btimed out\b", r"\brate limit\b", r"\bunauthorized\b",
-    r"\b404\b", r"\b500\b",
+    r"\berrors?\b", r"\bexceptions?\b", r"\bfailed\b", r"\bfailures?\b",
+    r"\btraceback\b", r"\binvalid\b", r"\bmalformed\b", r"\bcould not\b",
+    r"\bunable to\b", r"\btimed out\b", r"\brate limit\b", r"\bunauthorized\b",
+    r"\bnot found\b", r"\bforbidden\b", r"\b40[0-9]\b", r"\b50[0-9]\b",
 ]
 _ERROR_RE = re.compile("|".join(_ERROR_PATTERNS), re.IGNORECASE)
+
+# Negation / benign contexts that should NOT count as a failure. Real agents
+# routinely say "no errors", "without error", "error handling", "error: none",
+# "0 errors", "successfully" near the word error. These would cause false
+# positives on healthy runs, so we strip matches that sit in such a context.
+_NEGATION_RE = re.compile(
+    r"(no|none|without|zero|0|free of|handled?|handling|catch|caught|ignore[ds]?|"
+    r"avoid(ed|ing)?|prevent(ed|ing)?)\s+"
+    r"(\w+\s+){0,2}(error|exception|failure|fault)s?"
+    r"|(error|exception|failure)s?\s*[:=]\s*(none|null|0|\[\]|\{\}|false)"
+    r"|(error|exception|failure)s?\s+(handling|handler|case|cases|message|"
+    r"messages|boundary|boundaries|rate|recovery|path|state)"
+    r"|(success(fully)?|passed|completed)\s+(\w+\s+){0,3}(no|without|zero)\s+"
+    r"(\w+\s+){0,1}(error|failure)"
+    r"|no issues",
+    re.IGNORECASE,
+)
 
 
 def _output_str(data: dict) -> str:
@@ -39,11 +56,31 @@ def _output_str(data: dict) -> str:
     return "" if out is None else str(out)
 
 
+def _text_has_error_signal(text: str) -> bool:
+    """
+    True if text contains an error signal that is NOT in a negated/benign context.
+
+    Strategy: find each error-keyword hit and inspect a small window around it.
+    If that window matches a negation pattern, the hit is discounted. Only an
+    un-negated hit counts as a real error signal.
+    """
+    if not text:
+        return False
+    for m in _ERROR_RE.finditer(text):
+        start = max(0, m.start() - 40)
+        end = min(len(text), m.end() + 15)
+        window = text[start:end]
+        if not _NEGATION_RE.search(window):
+            return True
+    return False
+
+
 def _has_error(data: dict) -> bool:
-    """A node 'has an error' if it threw an exception OR its output carries an error signal."""
+    """A node 'has an error' if it threw an exception OR its output carries an
+    un-negated error signal."""
     if not data.get("success", True):
         return True
-    return bool(_ERROR_RE.search(_output_str(data)))
+    return _text_has_error_signal(_output_str(data))
 
 
 def detect_symptom(dag: nx.DiGraph) -> str | None:
@@ -111,11 +148,15 @@ def score_suspects(dag: nx.DiGraph, symptom_id: str) -> list[dict]:
             score += 0.50
             reasons.append("INTRODUCED the error (inputs were clean)")
 
-        if "tool:" in data.get("node_name", ""):
-            score += 0.25
-            reasons.append("tool call (external data source)")
+        node_has_error = _has_error(data)
 
-        if _has_error(data):
+        # tool bonus only when the tool ITSELF carries the error — a clean tool
+        # that merely ran near the failure should not be inflated.
+        if "tool:" in data.get("node_name", "") and node_has_error:
+            score += 0.25
+            reasons.append("errored tool call (external data source)")
+
+        if node_has_error:
             score += 0.20
             reasons.append("output contains error signal")
 

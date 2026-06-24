@@ -57,6 +57,10 @@ ranked root-cause suspects  # the INTRODUCER wins, not the symptom
 pip install -r requirements.txt
 python tests/test_agent.py     # produces healthy + poisoned traces
 python tests/test_scorer.py    # runs the full blame analysis
+python tests/test_detection.py # negation-aware error detection unit tests
+python tests/test_branching_agent.py   # branching multi-tool agent
+python tests/test_react_loop.py        # cyclic ReAct loop
+python tests/test_real_agent.py        # real create_react_agent graph
 ```
 
 ## Layout
