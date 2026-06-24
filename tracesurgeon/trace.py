@@ -30,11 +30,18 @@ class TraceSession:
         self.traces_dir.mkdir(exist_ok=True)
         self.events: list[TraceEvent] = []
         self._output_path = self.traces_dir / f"run_{self.session_id}.jsonl"
+        # start each session with a fresh file — a fixed session_id reused across
+        # runs must NOT accumulate events from previous runs (that corrupts the
+        # graph with duplicate/merged trajectories).
+        self._started = False
 
     def add_event(self, event: TraceEvent):
         self.events.append(event)
-        # write immediately so nothing is lost if the agent crashes
-        with open(self._output_path, "a", encoding="utf-8") as f:
+        # first write truncates; subsequent writes append. Written immediately so
+        # nothing is lost if the agent crashes mid-run.
+        mode = "a" if self._started else "w"
+        self._started = True
+        with open(self._output_path, mode, encoding="utf-8") as f:
             f.write(json.dumps(event.to_dict()) + "\n")
 
     def output_path(self) -> Path:

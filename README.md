@@ -17,7 +17,7 @@ error.
 | 3 | Blame scorer (anti-blame-hoarding) | ✅ |
 | — | Hardening: real names, loops, dual-layer merge, public API | ✅ |
 | — | Validated on real `create_react_agent` graph | ✅ |
-| 4 | CLI + UI | planned |
+| 4 | CLI + packaging (`tracesurgeon` command) | ✅ |
 | 5 | Semantic Edge Inferrer | planned |
 | 6 | Counterfactual verification | planned |
 
@@ -25,6 +25,22 @@ Validated topologies: linear, branching/multi-tool, cyclic ReAct loops, and a
 production-style `create_react_agent` graph (multi-turn, parallel tool calls,
 real `ToolNode` + message state). In every case blame lands on the upstream
 origin, not the downstream symptom.
+
+## Install
+
+```bash
+pip install -e .          # gives you the `tracesurgeon` command
+```
+
+## CLI
+
+```bash
+tracesurgeon debug traces/run_x.jsonl    # full root-cause report
+tracesurgeon list                        # all traces + clean/failure status
+tracesurgeon show traces/run_x.jsonl     # raw execution tree
+```
+
+`debug` exits non-zero when a failure is detected, so it composes in CI/scripts.
 
 ## One-liner usage
 
