@@ -1,4 +1,5 @@
 import json
+import threading
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -34,15 +35,22 @@ class TraceSession:
         # runs must NOT accumulate events from previous runs (that corrupts the
         # graph with duplicate/merged trajectories).
         self._started = False
+        # real agents run nodes/tools concurrently (parallel branches, async,
+        # threads). Serialize all writes so the list append + the file append
+        # are atomic and lines never interleave. Held only briefly (no await/IO
+        # blocking beyond the write), so it is safe under asyncio too.
+        self._lock = threading.Lock()
 
     def add_event(self, event: TraceEvent):
-        self.events.append(event)
-        # first write truncates; subsequent writes append. Written immediately so
-        # nothing is lost if the agent crashes mid-run.
-        mode = "a" if self._started else "w"
-        self._started = True
-        with open(self._output_path, mode, encoding="utf-8") as f:
-            f.write(json.dumps(event.to_dict()) + "\n")
+        with self._lock:
+            self.events.append(event)
+            # first write truncates; subsequent writes append. Written immediately
+            # so nothing is lost if the agent crashes mid-run.
+            mode = "a" if self._started else "w"
+            self._started = True
+            with open(self._output_path, mode, encoding="utf-8") as f:
+                f.write(json.dumps(event.to_dict()) + "\n")
+                f.flush()
 
     def output_path(self) -> Path:
         return self._output_path

@@ -12,7 +12,9 @@ from pathlib import Path
 HERE = Path(__file__).parent
 SUITES = [
     "test_detection.py",       # negation-aware error detection (unit)
+    "test_error_corpus.py",    # comprehensive real-world error recall/precision
     "test_edge_cases.py",      # synthetic edge cases / robustness
+    "test_production.py",       # async, concurrency, crash-proof
     "test_scorer.py",          # linear agent blame
     "test_dag.py",             # dag builder
     "test_branching_agent.py", # branching multi-tool

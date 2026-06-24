@@ -24,12 +24,70 @@ import re
 import networkx as nx
 
 
-# error signals. \b word boundaries stop "invalid" matching "invalid_tool_calls".
+# Error signals, tuned against REAL provider/tool/framework errors. Organized by
+# category for maintainability. \b word boundaries stop "invalid" matching
+# "invalid_tool_calls". Designed for high recall on real failures while the
+# negation pass (below) suppresses benign mentions like "no errors".
 _ERROR_PATTERNS = [
+    # --- generic keywords ---
     r"\berrors?\b", r"\bexceptions?\b", r"\bfailed\b", r"\bfailures?\b",
-    r"\btraceback\b", r"\binvalid\b", r"\bmalformed\b", r"\bcould not\b",
-    r"\bunable to\b", r"\btimed out\b", r"\brate limit\b", r"\bunauthorized\b",
-    r"\bnot found\b", r"\bforbidden\b", r"\b40[0-9]\b", r"\b50[0-9]\b",
+    r"\bfailing\b", r"\bfatal\b", r"\bcrash(ed|ing)?\b", r"\btraceback\b",
+    r"\baborted?\b", r"\bpanic(ked)?\b", r"\bstack ?trace\b",
+
+    # --- validity / parsing ---
+    r"\binvalid\b", r"\bmalformed\b", r"\bcorrupt(ed)?\b", r"\bunparseable\b",
+    r"\bnot ?(a )?valid\b", r"\bparse (error|fail)", r"\bdecode (error|fail)",
+    r"\bunexpected (token|character|eof|end)", r"\bschema (error|mismatch)",
+    r"\bvalidation (error|failed)", r"\bunable to parse\b",
+
+    # --- capability / could-not ---
+    r"\bcould ?n[o']t\b", r"\bcannot\b", r"\bunable to\b", r"\bdid ?n[o']t\b",
+    r"\bfailed to\b", r"\bunsupported\b", r"\bnot (implemented|supported|allowed)\b",
+
+    # --- timeouts / limits / capacity ---
+    r"\btimed ?out\b", r"timeout\b", r"\btimeout(error)?\b",
+    r"\brate[ -]?limit", r"\bquota\b", r"\bthrottl(e|ed|ing)\b",
+    r"\bexceeded\b", r"\boverloaded\b", r"\bcapacity\b", r"\btoo many\b",
+    r"\bcontext (window|length)\b", r"\bmax(imum)? tokens?\b",
+    r"\bout of (memory|range|bounds)\b", r"\boom\b", r"\bmemory ?error\b",
+
+    # --- auth / permission ---
+    r"\bunauthori[sz]ed\b", r"\bforbidden\b", r"\bpermission denied\b",
+    r"\baccess denied\b", r"\bauthenticat\w* (error|failed)\b",
+    r"\binvalid (api ?key|token|credential)", r"\bexpired (token|key|session)\b",
+    r"\bunauthenticated\b", r"\bnot authori[sz]ed\b",
+
+    # --- network / connectivity ---
+    r"\bconnection (refused|reset|error|aborted|closed)\b", r"\bconnreset\b",
+    r"\bunreachable\b", r"\bdns\b.{0,15}(fail|error)", r"\bssl\b.{0,15}(error|fail)",
+    r"\bmax retries\b", r"\bretries exceeded\b", r"\bbroken pipe\b",
+    r"\bnetwork (error|failure|unreachable)\b", r"\bsocket\b.{0,15}(error|closed)",
+
+    # --- HTTP statuses & phrases ---
+    r"\bnot found\b", r"\bbad request\b", r"\bbad gateway\b",
+    r"\bservice unavailable\b", r"\bgateway timeout\b",
+    r"\binternal server error\b", r"\btoo many requests\b",
+    r"\bserver error\b", r"\bupstream (error|timeout|fail)",
+    r"\b(?:HTTP|status|code|err\w*)\b\W{0,10}[45]\d\d\b",
+    r"\b[45]\d\d\b\W{0,4}(?:error|unavailable|gateway|forbidden|unauthori|"
+    r"not\s+found|too\s+many|bad\s+request|internal|server|timeout)",
+
+    # --- data / lookup / state ---
+    r"\bnot found\b", r"\bmissing\b.{0,20}(key|field|value|argument|param)",
+    r"\bno (data|results?|response|rows?|records?) (found|returned|available)\b",
+    r"\bnull\b.{0,10}(pointer|reference)", r"\bundefined\b.{0,15}(is not|error)",
+    r"\bkeyerror\b", r"\bindexerror\b", r"\battributeerror\b",
+    r"\btypeerror\b", r"\bvalueerror\b",
+
+    # --- process / execution / infra ---
+    r"\bnon[- ]?zero\b", r"\bexit (status|code)\s*[1-9]", r"\breturned \d+\b.{0,10}error",
+    r"\bsegfault\b", r"\bsegmentation fault\b", r"\bcore dumped\b", r"\bkilled\b",
+    r"\bdeadlock\b", r"\broll(?:ed)?[ -]?back\b", r"\brejected\b", r"\bdenied\b",
+    r"\bdisconnected\b",
+
+    # --- CamelCase exception class names (KeyError, JSONDecodeError, …) ---
+    r"\b[A-Z][A-Za-z0-9]*Errors?\b", r"\b[A-Z][A-Za-z0-9]*Exceptions?\b",
+    r"\b[A-Z][A-Za-z0-9]*(Timeout|Refused|Failure)\b",
 ]
 _ERROR_RE = re.compile("|".join(_ERROR_PATTERNS), re.IGNORECASE)
 
@@ -42,8 +100,10 @@ _NEGATION_RE = re.compile(
     r"avoid(ed|ing)?|prevent(ed|ing)?)\s+"
     r"(\w+\s+){0,2}(error|exception|failure|fault)s?"
     r"|(error|exception|failure)s?\s*[:=]\s*(none|null|0|\[\]|\{\}|false)"
-    r"|(error|exception|failure)s?\s+(handling|handler|case|cases|message|"
-    r"messages|boundary|boundaries|rate|recovery|path|state)"
+    r"|(error|exception|failure|timeout|timeouts|retry|retries)\s+"
+    r"(handling|handler|handlers|logic|config\w*|case|cases|message|"
+    r"messages|boundary|boundaries|rate|recovery|path|state|policy|"
+    r"policies|wrapper|strategy|strategies|behaviou?r)"
     r"|(success(fully)?|passed|completed)\s+(\w+\s+){0,3}(no|without|zero)\s+"
     r"(\w+\s+){0,1}(error|failure)"
     r"|no issues",

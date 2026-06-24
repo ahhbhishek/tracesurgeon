@@ -1,3 +1,4 @@
+import threading
 import time
 import uuid
 from typing import Any
@@ -50,278 +51,232 @@ def _safe_serialize(obj: Any, _depth: int = 0) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_safe_serialize(i, _depth + 1) for i in obj]
     # fallback: stringify (also truncated)
-    return _truncate(str(obj))
+    try:
+        return _truncate(str(obj))
+    except Exception:
+        return "<unserializable>"
+
+
+def _guard(method):
+    """
+    Decorator: a tracing callback must NEVER crash the host agent.
+
+    LangChain already isolates handler exceptions to some degree, but we add our
+    own belt-and-suspenders: any error inside a handler is swallowed (optionally
+    surfaced once via the session) so the user's agent keeps running even if we
+    hit an un-serializable object or an internal bug.
+    """
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as e:  # noqa: BLE001 - intentional catch-all
+            self._note_internal_error(method.__name__, e)
+            return None
+    wrapper.__name__ = method.__name__
+    return wrapper
 
 
 class TraceInterceptor(BaseCallbackHandler):
     """
-    Hooks into every LangGraph node and tool call.
-    Records inputs, outputs, timing, and parent-child relationships
-    into a .jsonl file for later analysis.
+    Hooks into every LangGraph node, tool, and LLM call and records inputs,
+    outputs, timing, and parent-child relationships into a .jsonl file.
+
+    Production-safe:
+      - shared state (`_active`) guarded by a lock for concurrent/parallel nodes
+      - every callback wrapped so it can never crash the host agent
+      - async callbacks supported (delegate to the same sync logic)
     """
+
+    # we don't want LangChain to retry/raise on handler errors
+    raise_error: bool = False
 
     def __init__(self, session: TraceSession):
         super().__init__()
         self.session = session
         # maps run_id → { step_id, start_time, node_name, parent_step_id }
         self._active: dict[str, dict] = {}
+        self._active_lock = threading.Lock()
+        self._internal_errors: list[str] = []
+
+    def _note_internal_error(self, where: str, err: Exception) -> None:
+        msg = f"{where}: {type(err).__name__}: {err}"
+        # keep a small bounded record; never raise
+        if len(self._internal_errors) < 50:
+            self._internal_errors.append(msg)
 
     # ------------------------------------------------------------------ #
-    #  Chain (LangGraph node) events                                       #
+    #  shared-state helpers (locked)                                      #
     # ------------------------------------------------------------------ #
 
-    def on_chain_start(
-        self,
-        serialized: dict,
-        inputs: dict,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        metadata: dict | None = None,
-        **kwargs,
-    ):
+    def _register(self, run_id: UUID, step_id: str, node_name: str,
+                  parent_step_id: str | None) -> None:
+        with self._active_lock:
+            self._active[str(run_id)] = {
+                "step_id": step_id,
+                "start_time": time.monotonic(),
+                "node_name": node_name,
+                "parent_step_id": parent_step_id,
+            }
+
+    def _pop(self, run_id: UUID) -> dict | None:
+        with self._active_lock:
+            return self._active.pop(str(run_id), None)
+
+    def _resolve_parent(self, parent_run_id: UUID | None) -> str | None:
+        if parent_run_id is None:
+            return None
+        with self._active_lock:
+            return self._active.get(str(parent_run_id), {}).get("step_id")
+
+    # ------------------------------------------------------------------ #
+    #  Chain (LangGraph node) events                                      #
+    # ------------------------------------------------------------------ #
+
+    @_guard
+    def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None,
+                       tags=None, metadata=None, **kwargs):
         step_id = str(uuid.uuid4())[:8]
         parent_step_id = self._resolve_parent(parent_run_id)
         node_name = self._extract_name(serialized, tags, metadata)
-
-        self._active[str(run_id)] = {
-            "step_id": step_id,
-            "start_time": time.monotonic(),
-            "node_name": node_name,
-            "parent_step_id": parent_step_id,
-        }
-
+        self._register(run_id, step_id, node_name, parent_step_id)
         self.session.add_event(TraceEvent(
-            event_type="node_start",
-            step_id=step_id,
-            parent_step_id=parent_step_id,
-            node_name=node_name,
-            inputs=_safe_serialize(inputs),
-            outputs=None,
+            event_type="node_start", step_id=step_id, parent_step_id=parent_step_id,
+            node_name=node_name, inputs=_safe_serialize(inputs), outputs=None,
             timestamp=TraceSession.now(),
         ))
 
-    def on_chain_end(
-        self,
-        outputs: dict,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs,
-    ):
-        meta = self._active.pop(str(run_id), None)
+    @_guard
+    def on_chain_end(self, outputs, *, run_id, parent_run_id=None, **kwargs):
+        meta = self._pop(run_id)
         if not meta:
             return
-
         duration = (time.monotonic() - meta["start_time"]) * 1000
-
         self.session.add_event(TraceEvent(
-            event_type="node_end",
-            step_id=meta["step_id"],
-            parent_step_id=meta["parent_step_id"],
-            node_name=meta["node_name"],
-            inputs=None,
-            outputs=_safe_serialize(outputs),
-            timestamp=TraceSession.now(),
-            duration_ms=round(duration, 2),
-            success=True,
+            event_type="node_end", step_id=meta["step_id"],
+            parent_step_id=meta["parent_step_id"], node_name=meta["node_name"],
+            inputs=None, outputs=_safe_serialize(outputs),
+            timestamp=TraceSession.now(), duration_ms=round(duration, 2), success=True,
         ))
 
-    def on_chain_error(
-        self,
-        error: BaseException,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs,
-    ):
-        meta = self._active.pop(str(run_id), None)
+    @_guard
+    def on_chain_error(self, error, *, run_id, parent_run_id=None, **kwargs):
+        meta = self._pop(run_id)
         if not meta:
             return
-
         duration = (time.monotonic() - meta["start_time"]) * 1000
-
         self.session.add_event(TraceEvent(
-            event_type="error",
-            step_id=meta["step_id"],
-            parent_step_id=meta["parent_step_id"],
-            node_name=meta["node_name"],
-            inputs=None,
-            outputs=None,
-            timestamp=TraceSession.now(),
-            duration_ms=round(duration, 2),
-            error=str(error),
-            success=False,
+            event_type="error", step_id=meta["step_id"],
+            parent_step_id=meta["parent_step_id"], node_name=meta["node_name"],
+            inputs=None, outputs=None, timestamp=TraceSession.now(),
+            duration_ms=round(duration, 2), error=str(error), success=False,
         ))
 
     # ------------------------------------------------------------------ #
-    #  Tool events                                                         #
+    #  Tool events                                                        #
     # ------------------------------------------------------------------ #
 
-    def on_tool_start(
-        self,
-        serialized: dict,
-        input_str: str,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        tags: list[str] | None = None,
-        **kwargs,
-    ):
+    @_guard
+    def on_tool_start(self, serialized, input_str, *, run_id, parent_run_id=None,
+                      tags=None, **kwargs):
         step_id = str(uuid.uuid4())[:8]
         parent_step_id = self._resolve_parent(parent_run_id)
         tool_name = (serialized or {}).get("name", "unknown_tool")
-
-        self._active[str(run_id)] = {
-            "step_id": step_id,
-            "start_time": time.monotonic(),
-            "node_name": f"tool:{tool_name}",
-            "parent_step_id": parent_step_id,
-        }
-
+        self._register(run_id, step_id, f"tool:{tool_name}", parent_step_id)
         self.session.add_event(TraceEvent(
-            event_type="tool_start",
-            step_id=step_id,
-            parent_step_id=parent_step_id,
-            node_name=f"tool:{tool_name}",
-            inputs=_safe_serialize(input_str),
-            outputs=None,
-            timestamp=TraceSession.now(),
+            event_type="tool_start", step_id=step_id, parent_step_id=parent_step_id,
+            node_name=f"tool:{tool_name}", inputs=_safe_serialize(input_str),
+            outputs=None, timestamp=TraceSession.now(),
         ))
 
-    def on_tool_end(
-        self,
-        output: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs,
-    ):
-        meta = self._active.pop(str(run_id), None)
+    @_guard
+    def on_tool_end(self, output, *, run_id, parent_run_id=None, **kwargs):
+        meta = self._pop(run_id)
         if not meta:
             return
-
         duration = (time.monotonic() - meta["start_time"]) * 1000
-
         self.session.add_event(TraceEvent(
-            event_type="tool_end",
-            step_id=meta["step_id"],
-            parent_step_id=meta["parent_step_id"],
-            node_name=meta["node_name"],
-            inputs=None,
-            outputs=_safe_serialize(str(output)),
-            timestamp=TraceSession.now(),
-            duration_ms=round(duration, 2),
-            success=True,
+            event_type="tool_end", step_id=meta["step_id"],
+            parent_step_id=meta["parent_step_id"], node_name=meta["node_name"],
+            inputs=None, outputs=_safe_serialize(str(output)),
+            timestamp=TraceSession.now(), duration_ms=round(duration, 2), success=True,
         ))
 
-    def on_tool_error(
-        self,
-        error: BaseException,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs,
-    ):
-        meta = self._active.pop(str(run_id), None)
+    @_guard
+    def on_tool_error(self, error, *, run_id, parent_run_id=None, **kwargs):
+        meta = self._pop(run_id)
         if not meta:
             return
-
         duration = (time.monotonic() - meta["start_time"]) * 1000
-
         self.session.add_event(TraceEvent(
-            event_type="error",
-            step_id=meta["step_id"],
-            parent_step_id=meta["parent_step_id"],
-            node_name=meta["node_name"],
-            inputs=None,
-            outputs=None,
-            timestamp=TraceSession.now(),
-            duration_ms=round(duration, 2),
-            error=str(error),
-            success=False,
+            event_type="error", step_id=meta["step_id"],
+            parent_step_id=meta["parent_step_id"], node_name=meta["node_name"],
+            inputs=None, outputs=None, timestamp=TraceSession.now(),
+            duration_ms=round(duration, 2), error=str(error), success=False,
         ))
 
     # ------------------------------------------------------------------ #
-    #  LLM events (capture model calls)                                   #
+    #  LLM events                                                         #
     # ------------------------------------------------------------------ #
 
-    def on_llm_start(
-        self,
-        serialized: dict,
-        prompts: list[str],
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs,
-    ):
+    @_guard
+    def on_llm_start(self, serialized, prompts, *, run_id, parent_run_id=None, **kwargs):
         step_id = str(uuid.uuid4())[:8]
         parent_step_id = self._resolve_parent(parent_run_id)
         model_name = (serialized or {}).get("kwargs", {}).get("model_name", "llm")
-
-        self._active[str(run_id)] = {
-            "step_id": step_id,
-            "start_time": time.monotonic(),
-            "node_name": f"llm:{model_name}",
-            "parent_step_id": parent_step_id,
-        }
-
+        self._register(run_id, step_id, f"llm:{model_name}", parent_step_id)
         self.session.add_event(TraceEvent(
-            event_type="node_start",
-            step_id=step_id,
-            parent_step_id=parent_step_id,
-            node_name=f"llm:{model_name}",
-            inputs=_safe_serialize(prompts),
-            outputs=None,
-            timestamp=TraceSession.now(),
+            event_type="node_start", step_id=step_id, parent_step_id=parent_step_id,
+            node_name=f"llm:{model_name}", inputs=_safe_serialize(prompts),
+            outputs=None, timestamp=TraceSession.now(),
         ))
 
-    def on_llm_end(
-        self,
-        response: LLMResult,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs,
-    ):
-        meta = self._active.pop(str(run_id), None)
+    @_guard
+    def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs):
+        meta = self._pop(run_id)
         if not meta:
             return
-
         duration = (time.monotonic() - meta["start_time"]) * 1000
         output_text = None
-        if response.generations:
-            output_text = response.generations[0][0].text if response.generations[0] else None
-
+        try:
+            if response.generations and response.generations[0]:
+                output_text = response.generations[0][0].text
+        except Exception:
+            output_text = None
         self.session.add_event(TraceEvent(
-            event_type="node_end",
-            step_id=meta["step_id"],
-            parent_step_id=meta["parent_step_id"],
-            node_name=meta["node_name"],
-            inputs=None,
-            outputs=_safe_serialize(output_text),
-            timestamp=TraceSession.now(),
-            duration_ms=round(duration, 2),
-            success=True,
+            event_type="node_end", step_id=meta["step_id"],
+            parent_step_id=meta["parent_step_id"], node_name=meta["node_name"],
+            inputs=None, outputs=_safe_serialize(output_text),
+            timestamp=TraceSession.now(), duration_ms=round(duration, 2), success=True,
         ))
+
+    @_guard
+    def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs):
+        meta = self._pop(run_id)
+        if not meta:
+            return
+        duration = (time.monotonic() - meta["start_time"]) * 1000
+        self.session.add_event(TraceEvent(
+            event_type="error", step_id=meta["step_id"],
+            parent_step_id=meta["parent_step_id"], node_name=meta["node_name"],
+            inputs=None, outputs=None, timestamp=TraceSession.now(),
+            duration_ms=round(duration, 2), error=str(error), success=False,
+        ))
+
+    # ------------------------------------------------------------------ #
+    #  Async agents (ainvoke / astream)                                   #
+    #                                                                     #
+    #  This is a sync BaseCallbackHandler. LangChain's AsyncCallbackManager
+    #  automatically runs sync handlers in a thread-pool executor for async
+    #  runs, so these same methods fire correctly under ainvoke/astream.
+    #  Our shared state is lock-guarded and the file write is atomic, so
+    #  running in worker threads is safe. No separate async methods needed.
+    # ------------------------------------------------------------------ #
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                             #
     # ------------------------------------------------------------------ #
 
-    def _resolve_parent(self, parent_run_id: UUID | None) -> str | None:
-        if parent_run_id is None:
-            return None
-        return self._active.get(str(parent_run_id), {}).get("step_id")
-
-    def _extract_name(
-        self,
-        serialized: dict | None,
-        tags: list[str] | None,
-        metadata: dict | None = None,
-    ) -> str:
-        # LangGraph stamps the real node name here — by far the most useful label
+    def _extract_name(self, serialized, tags, metadata=None) -> str:
         if metadata and metadata.get("langgraph_node"):
             return metadata["langgraph_node"]
         serialized = serialized or {}
