@@ -20,3 +20,7 @@ Thumbs.db
 
 # env
 .env
+
+# exported conversation logs
+*-local-command-caveat*.txt
+2026-*.txt
