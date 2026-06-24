@@ -1,107 +1,158 @@
 # TraceSurgeon
 
-Causal, dependency-aware debugging for LangGraph agents.
+**Causal, dependency-aware root-cause debugging for LangGraph agents.**
 
-Standard attribution tools suffer from **blame hoarding** — they blame the final,
-loudest reasoning step for a failure, when the real cause was a quiet poisoned
-tool output several steps upstream. TraceSurgeon flows the blame *backward*
-through the agent's data-flow graph to the node that actually **introduced** the
-error.
+When an agent fails, standard tools blame the final, loudest reasoning step —
+"the model gave a bad answer". But the *real* cause is usually a quiet poisoned
+tool output several steps upstream. This is **blame hoarding**. TraceSurgeon
+flows blame *backward* through the agent's data-flow graph to the node that
+actually **introduced** the error — and tells you what to do about it.
 
-## Status
-
-| Phase | Feature | State |
-|-------|---------|-------|
-| 1 | Trace capture (LangGraph callback hook) | ✅ |
-| 2 | DAG builder (call-tree + timestamp data-flow) | ✅ |
-| 3 | Blame scorer (anti-blame-hoarding) | ✅ |
-| — | Hardening: real names, loops, dual-layer merge, public API | ✅ |
-| — | Validated on real `create_react_agent` graph | ✅ |
-| 4 | CLI + packaging (`tracesurgeon` command) | ✅ |
-| 5 | Semantic Edge Inferrer | planned |
-| 6 | Counterfactual verification | planned |
-
-Validated topologies: linear, branching/multi-tool, cyclic ReAct loops, and a
-production-style `create_react_agent` graph (multi-turn, parallel tool calls,
-real `ToolNode` + message state). In every case blame lands on the upstream
-origin, not the downstream symptom.
-
-### Production-hardened
-
-- **Thread-safe** — concurrent/parallel nodes and async (`ainvoke`) runs write
-  without corrupting the trace (verified: 400 events / 8 threads, 0 corruption).
-- **Crash-proof** — the interceptor can never crash the host agent; an
-  un-serializable payload degrades to `<unserializable>` and the agent finishes.
-- **Async-native** — sync handlers run in LangChain's async executor for
-  `ainvoke`/`astream`; no extra setup.
-- **Comprehensive error detection** — tuned against real OpenAI/Anthropic, HTTP,
-  network, stdlib, database, and infra errors: **100% recall, 100% precision**
-  on a 75-case corpus, with negation-awareness so "no errors"/"timeout handling"
-  don't false-trigger.
+```
+ROOT CAUSE
+  node:     tool:get_population   (confidence 100%)
+  when:     2026-06-24T16:25:57Z
+  why:      INTRODUCED the error (inputs were clean), errored tool call
+  input:    {'city': 'Paris'}
+  output:   "ERROR: census API returned HTTP 503, data unavailable"
+  fix →     Upstream service error (5xx / overloaded). Retry with backoff.  (upstream_5xx)
+  symptom:  surfaced at agent      ← where a naive tool would have blamed
+```
 
 ## Install
 
 ```bash
-pip install -e .          # gives you the `tracesurgeon` command
+pip install -e .                    # gives you the `tracesurgeon` command
+# optional: pip install -e ".[anthropic]"   # to drive a real Claude model
+```
+
+## Use it on your agent in 60 seconds
+
+Three lines around your existing `agent.invoke(...)`:
+
+```python
+from tracesurgeon import instrument, diagnose
+
+inst = instrument()                              # 1. make a tracer
+agent.invoke(inputs, config=inst.config)         # 2. run your agent as normal
+diagnose(inst.path).print()                      # 3. get the root-cause report
+```
+
+`config=inst.config` just adds a callback handler — it changes nothing about how
+your agent runs. Works with any LangGraph agent (custom `StateGraph`,
+`create_react_agent`, sync or async). A runnable copy is in
+[`examples/quickstart.py`](examples/quickstart.py):
+
+```bash
+python examples/quickstart.py
+```
+
+### Programmatic / CI use
+
+`diagnose()` returns a `Diagnosis` you can inspect — no printing required:
+
+```python
+diag = diagnose(inst.path)
+if diag.has_failure:
+    rc = diag.root_cause
+    print(rc["node_name"], rc["score"], rc["remediation"]["category"])
+
+report = diag.to_dict()    # full JSON-serializable report (inputs, output, pipeline…)
 ```
 
 ## CLI
 
 ```bash
-tracesurgeon debug traces/run_x.jsonl    # full root-cause report
-tracesurgeon list                        # all traces + clean/failure status
-tracesurgeon show traces/run_x.jsonl     # raw execution tree
+tracesurgeon debug [trace.jsonl]        # root-cause report (default: newest trace)
+tracesurgeon debug --json [trace.jsonl] # machine-readable JSON (pipe to jq, use in CI)
+tracesurgeon list [--dir traces]        # all traces + clean/failure status
+tracesurgeon list --json                # same, as JSON
+tracesurgeon show [trace.jsonl]         # raw execution tree (no scoring)
 ```
 
-`debug` exits non-zero when a failure is detected, so it composes in CI/scripts.
+- If you omit the trace path, the **newest** trace in `traces/` is used.
+- `debug` **exits non-zero** when a failure is detected, so it drops into CI:
+  `tracesurgeon debug && echo "clean"`.
+- Traces default to a `traces/` directory (auto-created). Change it with
+  `instrument(traces_dir="...")` or the `--dir` flag.
 
-## One-liner usage
+## What you get
 
-```python
-from tracesurgeon import instrument, diagnose
-
-inst = instrument()
-agent.invoke(inputs, config=inst.config)   # your real LangGraph agent
-diagnose(inst.path).print()                # root-cause report
-```
+| Field | Meaning |
+|-------|---------|
+| **root cause** | the node that *introduced* the error (not where it surfaced) |
+| **confidence** | how strongly the evidence points here (0–100%) |
+| **input / output** | the actual data in and out of the failing node |
+| **fix →** | a remediation hint, categorised (rate_limit, timeout, auth, upstream_5xx, bad_data, network, not_found, context_length, resource, process) |
+| **symptom** | where the failure became visible — what a naive tool would blame |
+| **blame ranking** | every suspect, scored, with the reasons |
+| **data-flow** | the execution pipeline with the root cause marked |
 
 ## How it works
 
 ```
 LangGraph agent
-   │  TraceInterceptor (callback handler)
+   │  TraceInterceptor (callback handler — thread-safe, crash-proof)
    ▼
 traces/run_*.jsonl          # every node's inputs, outputs, timing, errors
-   │  build_dataflow_dag()
+   │  build_dataflow_dag()  # reconstructs data flow from timestamps
    ▼
 data-flow DAG               # tool → step1 → step2 → step3
-   │  run_blame_analysis()
+   │  run_blame_analysis()  # the INTRODUCER (clean inputs, errored output) wins
    ▼
-ranked root-cause suspects  # the INTRODUCER wins, not the symptom
+report                      # ranked root cause + remediation
 ```
 
-## Quickstart
+The core idea: a node is the **introducer** if it has an error but *none of its
+upstream ancestors do*. That single rule is what flows blame past the loud
+downstream symptom to the quiet origin.
+
+## Production-hardened
+
+- **Thread-safe** — concurrent/parallel/async (`ainvoke`) runs never corrupt the
+  trace (verified: 400 events / 8 threads, 0 corruption).
+- **Crash-proof** — the interceptor can never crash your agent; an
+  un-serializable payload degrades to `<unserializable>` and the run finishes.
+- **Resilient analysis** — corrupted or truncated traces (agent crashed
+  mid-write) are parsed best-effort, not fatally.
+- **Comprehensive error detection** — tuned against real OpenAI/Anthropic, HTTP,
+  network, stdlib, database, and infra errors with negation-awareness so
+  "no errors" / "timeout handling" don't false-trigger.
+
+## Validated topologies
+
+Linear, branching/multi-tool, cyclic ReAct loops, and a production-style
+`create_react_agent` graph (multi-turn, parallel tool calls, real `ToolNode` +
+message state). In every case blame lands on the upstream origin.
+
+## Run the tests
 
 ```bash
-pip install -r requirements.txt
-python tests/test_agent.py     # produces healthy + poisoned traces
-python tests/test_scorer.py    # runs the full blame analysis
-python tests/test_detection.py # negation-aware error detection unit tests
-python tests/test_branching_agent.py   # branching multi-tool agent
-python tests/test_react_loop.py        # cyclic ReAct loop
-python tests/test_real_agent.py        # real create_react_agent graph
+python tests/run_all.py        # full suite
 ```
+
+## Limitations
+
+- A tool that returns **plausible-but-wrong** data with *no* error markers can't
+  be caught by signal detection alone (this is what counterfactual re-execution,
+  a planned feature, would address).
+- Data-flow between parallel branches is reconstructed from timestamps, so the
+  *visual* order of truly-concurrent nodes is approximate (blame is still correct
+  via the ancestor cone).
 
 ## Layout
 
 ```
 tracesurgeon/
-  interceptor.py   # LangGraph callback → trace events
-  trace.py         # TraceEvent + TraceSession (jsonl writer)
-  dag.py           # call-tree and data-flow graph builders
+  interceptor.py   # LangGraph callback → trace events (thread-safe, crash-proof)
+  trace.py         # TraceEvent + TraceSession (atomic jsonl writer)
+  dag.py           # call-tree + timestamp data-flow graph builders
   scorer.py        # failure detection + blame ranking
+  report.py        # remediation + JSON report + unified renderer
+  api.py           # instrument() / diagnose() — the public surface
+  cli.py           # the `tracesurgeon` command
+examples/
+  quickstart.py    # copy-paste integration on a tiny real agent
 tests/
-  test_agent.py    # fake agents (no API key needed)
-  test_dag.py
-  test_scorer.py
+  run_all.py       # runs every suite
 ```

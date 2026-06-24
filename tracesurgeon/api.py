@@ -11,12 +11,17 @@ Public API — the one-liner surface real users touch.
     report.print()                               # human-readable root-cause report
 """
 
+import re
 from dataclasses import dataclass
 
 from .interceptor import TraceInterceptor
 from .trace import TraceSession
-from .dag import build_dataflow_dag, print_pipeline
+from .dag import build_dataflow_dag
 from .scorer import run_blame_analysis
+from . import report as _report
+
+# strip our own markup tags but NOT escaped user brackets (\[)
+_MARKUP_RE = re.compile(r"(?<!\\)\[/?[a-z0-9_ #]+\]")
 
 
 @dataclass
@@ -47,36 +52,28 @@ class Diagnosis:
 
     @property
     def has_failure(self) -> bool:
-        return self.result["has_failure"]
+        return bool(self.result.get("has_failure"))
 
     @property
     def root_cause(self) -> dict | None:
-        return self.result.get("root_cause")
+        """The enriched root-cause dict (node_name, score, reasons, input_preview,
+        output_full, timestamp, remediation). None if the run is clean."""
+        return self.to_dict().get("root_cause")
+
+    def to_dict(self) -> dict:
+        """Full, JSON-serializable report (inputs, full output, timestamps,
+        remediation, pipeline). Ideal for programmatic use / CI."""
+        return _report.to_report_dict(self.result, self.flow)
 
     def print(self) -> None:
-        r = self.result
-        print("\n" + "=" * 60)
+        """Human-readable root-cause report (plain text; markup stripped)."""
+        def p(line: str = ""):
+            print(_MARKUP_RE.sub("", str(line)).replace("\\[", "["))
+
+        print("\n" + "=" * 62)
         print("  TraceSurgeon — Root Cause Report")
-        print("=" * 60)
-        if not r["has_failure"]:
-            print("\n  ✓ No failure detected — the run looks clean.\n")
-            return
-
-        rc = r["root_cause"]
-        sym = r["symptom"]
-        print(f"\n  Symptom (where it surfaced):  {sym['node_name']}")
-        print(f"  >>> ROOT CAUSE:  {rc['node_name']}  (confidence {rc['score']:.0%})")
-        print(f"      why: {', '.join(rc['reasons'])}")
-        print(f"      output: {rc['outputs_preview']!r}")
-
-        print(f"\n  Data-flow (root cause marked):")
-        print_pipeline(self.flow, highlight=[rc["step_id"]])
-
-        if len(r["suspects"]) > 1:
-            print(f"\n  Other suspects:")
-            for s in r["suspects"][1:4]:
-                print(f"    {s['score']:.2f}  {s['node_name']}")
-        print()
+        print("=" * 62)
+        _report.render(self.to_dict(), self.flow, p)
 
 
 def diagnose(trace_path: str) -> Diagnosis:

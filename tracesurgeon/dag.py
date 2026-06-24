@@ -39,29 +39,43 @@ def _is_nested(name: str) -> bool:
 # ------------------------------------------------------------------ #
 
 def _parse_steps(trace_path: str) -> dict[str, dict]:
-    """Merge start/end events per step_id into one record (with start & end ts)."""
+    """
+    Merge start/end events per step_id into one record (with start & end ts).
+
+    Robust to real-world damage: a trace whose agent crashed mid-write may have a
+    truncated final line; a hand-edited or concatenated file may have stray junk.
+    We skip unparseable / malformed lines instead of crashing, so a partial trace
+    still yields a partial-but-usable analysis.
+    """
     path = Path(trace_path)
     if not path.exists():
         raise FileNotFoundError(f"Trace not found: {trace_path}")
 
     steps: dict[str, dict] = {}
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            e = json.loads(line)
-            sid = e["step_id"]
+            try:
+                e = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue  # truncated/corrupt line — skip, keep what we can
+            if not isinstance(e, dict):
+                continue
+            sid = e.get("step_id")
+            etype = e.get("event_type")
+            if not sid or not etype:
+                continue  # not a TraceSurgeon event; ignore
             if sid not in steps:
                 steps[sid] = {
                     "step_id": sid,
                     "parent_step_id": e.get("parent_step_id"),
-                    "node_name": e["node_name"],
+                    "node_name": e.get("node_name") or "unknown_node",
                     "inputs": None, "outputs": None,
                     "duration_ms": None, "success": True, "error": None,
                     "start_ts": None, "end_ts": None,
                 }
-            etype = e["event_type"]
             if etype.endswith("_start"):
                 if steps[sid]["start_ts"] is None:
                     steps[sid]["start_ts"] = e.get("timestamp")
