@@ -24,9 +24,12 @@ classifiers = [
     "Topic :: System :: Monitoring",
 ]
 dependencies = [
-    "langgraph>=0.2.0",
-    "langchain>=0.3.0",
-    "langchain-core>=0.3.0",
+    # pinned to the validated range. LangGraph 1.3 turns create_react_agent into a
+    # hard error (moved to langchain.agents.create_agent) and changes tracing —
+    # these bounds keep installs deterministic against the API this targets.
+    "langgraph>=1.2,<1.3",
+    "langchain>=1.3,<2",
+    "langchain-core>=1.4,<2",
     "networkx>=3.3",
     "rich>=13.0",
 ]
