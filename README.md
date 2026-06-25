@@ -72,9 +72,43 @@ after:   clean   (no failure)
 
 Verdicts: **CONFIRMED** (clean after patch) · **PARTIAL** (original cause gone, a
 new one surfaced) · **NOT_CONFIRMED** (still fails the same way → wrong
-hypothesis) · **INCONCLUSIVE** (baseline had no failure). This catches the one
-thing signal-detection can't: a tool returning *plausible-but-wrong* data with no
-error markers — patch it, see if the outcome changes.
+hypothesis) · **INCONCLUSIVE** (baseline had no failure).
+
+#### Silent failures (no error markers)
+
+The hardest real bug: a tool returns *plausible-but-wrong* data — a bad exchange
+rate, a stale number — with **no error string at all**. Detection honestly finds
+nothing. Prove it anyway with a `check=` predicate on the result:
+
+```python
+diag = diagnose(inst.path)         # "no failure detected" — there's no error to see
+
+proof = diag.verify(
+    lambda config: agent.invoke(inputs, config=config),
+    replacement="92.0",            # the corrected tool output
+    tool="usd_to_eur",
+    check=lambda result: "92" in result["messages"][-1].content,  # is the answer right now?
+)
+# ✅ CONFIRMED — patching this one output makes the result correct.
+#    Causal proof of a SILENT failure (no error markers to detect).
+```
+
+This is the capability the field's attribution tools lack — proving causation
+when there is nothing to detect.
+
+### Validated live on a real LLM
+
+Run against `openai/gpt-oss-20b` (via OpenRouter) driving a real
+`create_react_agent`, TraceSurgeon correctly handled, end to end:
+
+| Scenario | Result |
+|----------|--------|
+| 5-tool financial pipeline, early tool errors | blamed the **origin** (`get_cost`), not the 3 downstream propagators |
+| silent wrong currency conversion (no error markers) | detection clean; `check=` **proved** `usd_to_eur` causally |
+| two independent poisoned tools | **both** flagged |
+| real provider errors (429 / 401 / 404 quota, auth, bad-model) | each caught and correctly categorised |
+
+See `tests/test_complex_live.py` (needs `OPENROUTER_API_KEY`).
 
 ### Programmatic / CI use
 

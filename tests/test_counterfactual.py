@@ -214,6 +214,64 @@ def test_prebuilt_react_agent():
           proof.verdict == "CONFIRMED" and proof.flipped, f"verdict={proof.verdict}")
 
 
+def test_silent_wrong_data_with_check():
+    """A tool returns plausible-but-wrong data with NO error markers. Detection
+    sees nothing; counterfactual with check= proves causation by output."""
+    @tool
+    def usd_to_eur(amount_usd: str) -> str:
+        """convert USD to EUR (silently wrong rate 10.0 instead of 0.92)"""
+        return str(float(amount_usd) * 10.0)
+
+    class S(TypedDict):
+        amount: str
+        result: str
+        messages: Annotated[list, operator.add]
+
+    def convert(s):
+        return {"result": usd_to_eur.invoke({"amount_usd": s["amount"]}),
+                "messages": [AIMessage(content="converted")]}
+
+    def report(s):
+        return {"messages": [AIMessage(content=f"EUR total: {s['result']}")]}
+
+    g = StateGraph(S)
+    g.add_node("convert", convert)
+    g.add_node("report", report)
+    g.set_entry_point("convert")
+    g.add_edge("convert", "report")
+    g.add_edge("report", END)
+    agent = g.compile()
+    inp = {"amount": "100", "messages": []}
+
+    inst = instrument(session_id="cf_silent")
+    agent.invoke(inp, config=inst.config)
+    diag = diagnose(inst.path)
+    # honest: no error markers -> detection finds nothing
+    check("silent failure: detection correctly finds no error", not diag.has_failure)
+
+    def correct(res):
+        import re
+        nums = [float(x) for x in re.findall(r"\d+\.?\d*", res["messages"][-1].content)]
+        return any(80 <= n <= 100 for n in nums)  # near 92
+
+    proof = counterfactual(
+        lambda cfg: agent.invoke(inp, config=cfg),
+        patch={"usd_to_eur": str(100 * 0.92)},
+        check=correct,
+    )
+    check("silent failure: check= proves causation (CONFIRMED)",
+          proof.verdict == "CONFIRMED" and proof.checked, f"verdict={proof.verdict}")
+
+    # patching to a STILL-wrong value must NOT confirm
+    proof2 = counterfactual(
+        lambda cfg: agent.invoke(inp, config=cfg),
+        patch={"usd_to_eur": "5000"},
+        check=correct,
+    )
+    check("silent failure: wrong patch -> NOT_CONFIRMED",
+          proof2.verdict == "NOT_CONFIRMED")
+
+
 def test_inconclusive_on_clean_baseline():
     # baseline with no failure -> nothing to verify
     @tool
@@ -251,7 +309,7 @@ if __name__ == "__main__":
     print("Counterfactual verification tests:\n")
     for fn in [test_confirmed, test_not_confirmed, test_direct_patch_value_and_callable,
                test_async, test_to_dict_serializable, test_prebuilt_react_agent,
-               test_inconclusive_on_clean_baseline]:
+               test_silent_wrong_data_with_check, test_inconclusive_on_clean_baseline]:
         try:
             fn()
         except Exception as e:

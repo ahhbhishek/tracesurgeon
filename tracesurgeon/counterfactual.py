@@ -119,11 +119,15 @@ class Counterfactual:
     baseline: dict | None = None       # report dict of the original run
     verdict: str = "INCONCLUSIVE"      # CONFIRMED | PARTIAL | NOT_CONFIRMED | INCONCLUSIVE
     flipped: bool = False
+    checked: bool = False              # True when a `check` predicate drove the verdict
+    check_error: str | None = None     # set if the check predicate itself threw
+    patched_result: Any = field(default=None, repr=False)  # raw agent result (not serialized)
 
     def to_dict(self) -> dict:
         return {
             "verdict": self.verdict,
             "flipped": self.flipped,
+            "checked": self.checked,
             "patch": {k: str(v) for k, v in self.patch.items()},
             "patched_trace_path": self.patched_trace_path,
             "baseline": self.baseline,
@@ -141,29 +145,44 @@ class Counterfactual:
         patched_kv = ", ".join(f"{k} = {str(v)[:60]!r}" for k, v in self.patch.items())
         p(f"  patched output:  {patched_kv}")
 
-        before = "FAIL " if (self.baseline and self.baseline.get("has_failure")) else "clean"
-        after = "FAIL " if self.patched.get("has_failure") else "clean"
-        b_rc = (self.baseline or {}).get("root_cause")
-        a_rc = self.patched.get("root_cause")
-        p(f"  before:  {before}   "
-          + (f"root cause = {b_rc['node_name']}" if b_rc else ""))
-        p(f"  after:   {after}   "
-          + (f"new root cause = {a_rc['node_name']}" if a_rc else "(no failure)"))
+        if self.checked:
+            # output-correctness mode (silent failures)
+            p("  mode:    output check (no error markers needed)")
+            p(f"  result:  {'passed' if self.flipped else 'still wrong'} after patch")
+        else:
+            before = "FAIL " if (self.baseline and self.baseline.get("has_failure")) else "clean"
+            after = "FAIL " if self.patched.get("has_failure") else "clean"
+            b_rc = (self.baseline or {}).get("root_cause")
+            a_rc = self.patched.get("root_cause")
+            p(f"  before:  {before}   "
+              + (f"root cause = {b_rc['node_name']}" if b_rc else ""))
+            p(f"  after:   {after}   "
+              + (f"new root cause = {a_rc['node_name']}" if a_rc else "(no failure)"))
         p()
 
-        banner = {
-            "CONFIRMED":
-                "  ✅ CONFIRMED — fixing this one output flips the run to clean.\n"
-                "     This is causal proof, not correlation.",
-            "PARTIAL":
-                "  🟡 PARTIALLY CONFIRMED — the original cause is resolved, but a\n"
-                "     different, independent failure surfaced downstream.",
-            "NOT_CONFIRMED":
-                "  ❌ NOT CONFIRMED — the run still fails the same way. This output\n"
-                "     was likely NOT the true cause (or not the only one).",
-            "INCONCLUSIVE":
-                "  ⚪ INCONCLUSIVE — the baseline run had no failure to verify.",
-        }.get(self.verdict, f"  verdict: {self.verdict}")
+        if self.checked:
+            banner = {
+                "CONFIRMED":
+                    "  ✅ CONFIRMED — patching this one output makes the result correct.\n"
+                    "     Causal proof of a SILENT failure (no error markers to detect).",
+                "NOT_CONFIRMED":
+                    "  ❌ NOT CONFIRMED — the result is still wrong after this patch.\n"
+                    "     This output was not the (only) cause.",
+            }.get(self.verdict, f"  verdict: {self.verdict}")
+        else:
+            banner = {
+                "CONFIRMED":
+                    "  ✅ CONFIRMED — fixing this one output flips the run to clean.\n"
+                    "     This is causal proof, not correlation.",
+                "PARTIAL":
+                    "  🟡 PARTIALLY CONFIRMED — the original cause is resolved, but a\n"
+                    "     different, independent failure surfaced downstream.",
+                "NOT_CONFIRMED":
+                    "  ❌ NOT CONFIRMED — the run still fails the same way. This output\n"
+                    "     was likely NOT the true cause (or not the only one).",
+                "INCONCLUSIVE":
+                    "  ⚪ INCONCLUSIVE — the baseline run had no failure to verify.",
+            }.get(self.verdict, f"  verdict: {self.verdict}")
         p(banner)
         p()
 
@@ -192,6 +211,7 @@ def counterfactual(
     patch: dict,
     *,
     baseline=None,
+    check: Callable[[Any], bool] | None = None,
     traces_dir: str = "traces",
     session_id: str | None = None,
 ) -> Counterfactual:
@@ -200,17 +220,24 @@ def counterfactual(
     failure flipped.
 
     run_fn(config): a thunk that runs your agent with the given config injected,
-                    e.g. `lambda cfg: agent.invoke(inputs, config=cfg)`.
+                    e.g. `lambda cfg: agent.invoke(inputs, config=cfg)`. Its return
+                    value (the agent's result) is captured and passed to `check`.
     patch:          {tool_name: replacement_value_or_callable}.  "tool:" prefix
                     on the name is accepted and stripped.
     baseline:       a Diagnosis, a report dict, or a trace path of the original
                     (failing) run, used for the before/after comparison.
+    check:          optional predicate on the patched run's RESULT. Use this for
+                    SILENT failures — a tool that returns plausible-but-wrong data
+                    with no error markers, where signal detection sees nothing.
+                    `check(result) is True` ⇒ the patch produced a correct outcome
+                    ⇒ CONFIRMED. This is how you prove causation when there is no
+                    error to detect.
     """
     base_rep = _as_report(baseline)
 
     inst = instrument(session_id=session_id or "counterfactual", traces_dir=traces_dir)
     with _patch_tool_outputs(patch):
-        run_fn(inst.config)
+        result = run_fn(inst.config)
     patched = diagnose(inst.path).to_dict()
 
     cf = Counterfactual(
@@ -218,8 +245,25 @@ def counterfactual(
         patched=patched,
         patched_trace_path=inst.path,
         baseline=base_rep,
+        patched_result=result,
     )
 
+    # --- output-correctness mode (silent failures) ---
+    if check is not None:
+        try:
+            passed = bool(check(result))
+        except Exception as e:  # a throwing check counts as "not fixed"
+            cf.verdict, cf.flipped = "NOT_CONFIRMED", False
+            cf.check_error = f"{type(e).__name__}: {e}"
+            return cf
+        cf.checked = True
+        if passed:
+            cf.verdict, cf.flipped = "CONFIRMED", True
+        else:
+            cf.verdict, cf.flipped = "NOT_CONFIRMED", False
+        return cf
+
+    # --- error-detection mode (default) ---
     base_failed = bool(base_rep and base_rep.get("has_failure"))
     if not base_failed:
         cf.verdict, cf.flipped = "INCONCLUSIVE", False

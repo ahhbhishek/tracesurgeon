@@ -75,7 +75,7 @@ class Diagnosis:
         print("=" * 62)
         _report.render(self.to_dict(), self.flow, p)
 
-    def verify(self, run_fn, replacement, *, tool: str | None = None):
+    def verify(self, run_fn, replacement, *, tool: str | None = None, check=None):
         """
         Counterfactual proof: re-run the agent with the root-cause tool's output
         replaced by `replacement`, and report whether the failure flips to clean.
@@ -84,6 +84,9 @@ class Diagnosis:
                         e.g. `lambda cfg: agent.invoke(inputs, config=cfg)`.
         tool:           override which tool to patch; defaults to the detected
                         root cause (must be a `tool:` node).
+        check:          optional predicate on the patched run's result — use it to
+                        verify a SILENT failure by output correctness rather than
+                        error detection (see counterfactual()).
         """
         from .counterfactual import counterfactual  # local import avoids a cycle
 
@@ -91,7 +94,10 @@ class Diagnosis:
         if name is None:
             rc = self.root_cause
             if not rc:
-                raise ValueError("No failure detected — nothing to verify.")
+                raise ValueError(
+                    "No failure detected — pass tool='<name>' to verify a specific "
+                    "tool (e.g. for a silent wrong-data failure with check=...)."
+                )
             if not rc["node_name"].startswith("tool:"):
                 raise ValueError(
                     f"Root cause '{rc['node_name']}' is not a tool. Counterfactual "
@@ -99,7 +105,7 @@ class Diagnosis:
                     "to verify a specific tool explicitly."
                 )
             name = rc["node_name"]
-        return counterfactual(run_fn, {name: replacement}, baseline=self)
+        return counterfactual(run_fn, {name: replacement}, baseline=self, check=check)
 
 
 def diagnose(trace_path: str) -> Diagnosis:
