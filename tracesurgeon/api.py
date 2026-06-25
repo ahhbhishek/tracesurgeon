@@ -75,6 +75,32 @@ class Diagnosis:
         print("=" * 62)
         _report.render(self.to_dict(), self.flow, p)
 
+    def verify(self, run_fn, replacement, *, tool: str | None = None):
+        """
+        Counterfactual proof: re-run the agent with the root-cause tool's output
+        replaced by `replacement`, and report whether the failure flips to clean.
+
+        run_fn(config): a thunk that runs your agent with the injected config,
+                        e.g. `lambda cfg: agent.invoke(inputs, config=cfg)`.
+        tool:           override which tool to patch; defaults to the detected
+                        root cause (must be a `tool:` node).
+        """
+        from .counterfactual import counterfactual  # local import avoids a cycle
+
+        name = tool
+        if name is None:
+            rc = self.root_cause
+            if not rc:
+                raise ValueError("No failure detected — nothing to verify.")
+            if not rc["node_name"].startswith("tool:"):
+                raise ValueError(
+                    f"Root cause '{rc['node_name']}' is not a tool. Counterfactual "
+                    "verification currently patches tool outputs — pass tool='<name>' "
+                    "to verify a specific tool explicitly."
+                )
+            name = rc["node_name"]
+        return counterfactual(run_fn, {name: replacement}, baseline=self)
+
 
 def diagnose(trace_path: str) -> Diagnosis:
     """Build the data-flow graph from a trace and run the full blame analysis."""

@@ -7,6 +7,7 @@ from .dag import (
 from .scorer import run_blame_analysis
 from .report import to_report_dict, classify_error
 from .api import instrument, diagnose, Instrumentation, Diagnosis
+from .counterfactual import counterfactual, Counterfactual
 
 __version__ = "0.1.0"
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "print_tree", "print_pipeline", "summarize_dag",
     "run_blame_analysis", "to_report_dict", "classify_error",
     "instrument", "diagnose", "Instrumentation", "Diagnosis",
+    "counterfactual", "Counterfactual",
 ]

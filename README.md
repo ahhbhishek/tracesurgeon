@@ -47,6 +47,35 @@ your agent runs. Works with any LangGraph agent (custom `StateGraph`,
 python examples/quickstart.py
 ```
 
+### Counterfactual verification — causal *proof*
+
+Diagnosis tells you which node *correlates* with the failure. **Verification
+proves it**: it re-runs your agent with the suspect tool's output replaced by a
+corrected value. If the failure disappears when (and only when) you fix that one
+output, that's causal proof — not a guess.
+
+```python
+diag = diagnose(inst.path)                      # "tool:get_population looks guilty"
+
+proof = diag.verify(
+    lambda config: agent.invoke(inputs, config=config),   # re-runnable thunk
+    replacement="Paris: 2.1 million",                     # the corrected output
+)
+proof.print()
+```
+
+```
+before:  FAIL    root cause = tool:get_population
+after:   clean   (no failure)
+✅ CONFIRMED — fixing this one output flips the run to clean. Causal proof, not correlation.
+```
+
+Verdicts: **CONFIRMED** (clean after patch) · **PARTIAL** (original cause gone, a
+new one surfaced) · **NOT_CONFIRMED** (still fails the same way → wrong
+hypothesis) · **INCONCLUSIVE** (baseline had no failure). This catches the one
+thing signal-detection can't: a tool returning *plausible-but-wrong* data with no
+error markers — patch it, see if the outcome changes.
+
 ### Programmatic / CI use
 
 `diagnose()` returns a `Diagnosis` you can inspect — no printing required:
@@ -105,7 +134,8 @@ report                      # ranked root cause + remediation
 
 The core idea: a node is the **introducer** if it has an error but *none of its
 upstream ancestors do*. That single rule is what flows blame past the loud
-downstream symptom to the quiet origin.
+downstream symptom to the quiet origin. Then `verify()` re-runs the agent with
+that node's output corrected to **prove** the link causally.
 
 ## Production-hardened
 
@@ -133,9 +163,12 @@ python tests/run_all.py        # full suite
 
 ## Limitations
 
-- A tool that returns **plausible-but-wrong** data with *no* error markers can't
-  be caught by signal detection alone (this is what counterfactual re-execution,
-  a planned feature, would address).
+- A tool that returns **plausible-but-wrong** data with *no* error markers won't
+  be flagged by automatic detection — but you can still **prove or rule it out**
+  with `diag.verify(...)` (counterfactual re-execution).
+- Counterfactual verification currently patches **tool** outputs; root causes that
+  are `llm:`/plain graph nodes need an explicit `tool=` or aren't patchable yet.
+- Verification is a Python-API feature (it must run your agent), not a CLI command.
 - Data-flow between parallel branches is reconstructed from timestamps, so the
   *visual* order of truly-concurrent nodes is approximate (blame is still correct
   via the ancestor cone).

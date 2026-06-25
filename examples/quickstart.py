@@ -74,6 +74,17 @@ if __name__ == "__main__":
         print(f"[CI] root cause = {rc['node_name']} "
               f"({rc['remediation']['category']})")
 
+    # 4) PROVE it — counterfactual verification.
+    #    Re-run the agent with the suspect tool's output replaced by a good value.
+    #    If the failure disappears, that's causal proof (not just correlation).
+    if diag.has_failure:
+        proof = diag.verify(
+            lambda config: agent.invoke({"query": "capital of France", "messages": []},
+                                        config=config),
+            replacement="Paris has 2.1 million people",
+        )
+        proof.print()   # -> CONFIRMED: fixing this one output flips the run to clean
+
     # the trace is saved to inst.path; you can also analyze it from the CLI:
     #   tracesurgeon debug traces/run_quickstart.jsonl
     #   tracesurgeon debug --json traces/run_quickstart.jsonl
