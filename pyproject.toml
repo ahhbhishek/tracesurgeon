@@ -41,9 +41,9 @@ dev = ["pytest>=8.0"]
 tracesurgeon = "tracesurgeon.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/Abhishek/tracesurgeon"
-Repository = "https://github.com/Abhishek/tracesurgeon"
-Issues = "https://github.com/Abhishek/tracesurgeon/issues"
+Homepage = "https://github.com/ahhbhishek/tracesurgeon"
+Repository = "https://github.com/ahhbhishek/tracesurgeon"
+Issues = "https://github.com/ahhbhishek/tracesurgeon/issues"
 
 [tool.setuptools.packages.find]
 include = ["tracesurgeon*"]
