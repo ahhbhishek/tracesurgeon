@@ -7,7 +7,7 @@
 When an agent fails, find the node that **caused** it — not the one that **shows** it — and prove it.
 
 [![tests](https://github.com/ahhbhishek/tracesurgeon/actions/workflows/ci.yml/badge.svg)](https://github.com/ahhbhishek/tracesurgeon/actions/workflows/ci.yml)
-![python](https://img.shields.io/badge/python-3.10%20–%203.12-3776ab)
+![python](https://img.shields.io/badge/python-3.11%20–%203.12-3776ab)
 ![license](https://img.shields.io/badge/license-MIT-3fb950)
 ![built for](https://img.shields.io/badge/built%20for-LangGraph-1c7ed6)
 
@@ -44,7 +44,7 @@ A tool returns a 503. Three nodes later, the model says *"I couldn't finish."* E
 
 ### 1. Install
 
-Requires **Python 3.10+**. Clone the repo and install it:
+Requires **Python 3.11+**. Clone the repo and install it:
 
 ```bash
 git clone https://github.com/ahhbhishek/tracesurgeon.git
