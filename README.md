@@ -42,9 +42,29 @@ A tool returns a 503. Three nodes later, the model says *"I couldn't finish."* E
 
 ## Quickstart
 
+### 1. Install
+
+Requires **Python 3.10+**. Clone the repo and install it:
+
 ```bash
-pip install -e .          # gives you the `tracesurgeon` command
+git clone https://github.com/ahhbhishek/tracesurgeon.git
+cd tracesurgeon
+pip install -e .          # installs the library + the `tracesurgeon` CLI
 ```
+
+> Tip: use a fresh virtual environment first — `python -m venv .venv && source .venv/bin/activate` (on Windows: `.venv\Scripts\activate`).
+
+### 2. Check it works
+
+Run the bundled example. It uses a tiny built-in agent, so **no API key is needed**:
+
+```bash
+python examples/quickstart.py
+```
+
+You should see a root-cause report ending with a green **`✅ CONFIRMED`** — if you do, your install is good.
+
+### 3. Use it on your own agent
 
 Three lines around your existing `agent.invoke(...)`:
 
@@ -52,11 +72,11 @@ Three lines around your existing `agent.invoke(...)`:
 from tracesurgeon import instrument, diagnose
 
 inst = instrument()                          # 1. make a tracer
-agent.invoke(inputs, config=inst.config)     # 2. run your agent as normal
+agent.invoke(inputs, config=inst.config)     # 2. run YOUR agent as normal
 diagnose(inst.path).print()                  # 3. get the root-cause report
 ```
 
-`config=inst.config` only adds a callback handler — it changes nothing about how your agent runs. Works with any LangGraph agent (custom `StateGraph`, `create_react_agent`, sync or async). A runnable copy lives in [`examples/quickstart.py`](examples/quickstart.py).
+Here `agent` and `inputs` are your own. `config=inst.config` only adds a callback handler — it changes nothing about how your agent runs. Works with any LangGraph agent (custom `StateGraph`, `create_react_agent`, sync or async). The full runnable example lives in [`examples/quickstart.py`](examples/quickstart.py).
 
 ## Proof, not correlation
 
@@ -178,12 +198,7 @@ tracesurgeon show  [trace.jsonl]          # raw execution tree (no scoring)
 
 `debug` exits non-zero when a failure is detected, so it drops straight into CI.
 
-## Limitations (honest)
 
-- Silent *plausible-but-wrong* data isn't flagged by automatic detection — but you can **prove or rule it out** with `verify(..., check=...)`.
-- Counterfactual verification patches **tool** outputs; `llm:` / plain graph-node causes need an explicit `tool=`.
-- Verification is a Python-API feature (it must run your agent), not a CLI command.
-- Parallel-branch data-flow is reconstructed from timestamps, so the *visual* order of truly-concurrent nodes is approximate — blame is still correct via the ancestor cone.
 
 ## Run the tests
 
